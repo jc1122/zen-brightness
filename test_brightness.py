@@ -55,7 +55,11 @@ class FakeDesktop(dbus.service.Object):
         self.events.append(dict(event=event, time=time.monotonic(), **values))
 
     def write_hw(self, value):
-        (self.directory / "brightness").write_text(str(value))
+        # Model a sysfs attribute read atomically. Truncating a regular file
+        # exposes an empty value to concurrent readers, unlike the real device.
+        staged = self.directory / ".brightness-next"
+        staged.write_text(str(value))
+        staged.replace(self.directory / "brightness")
         return GLib.SOURCE_REMOVE
 
     @dbus.service.method(TEST_IFACE, in_signature="iii", out_signature="")
@@ -169,7 +173,7 @@ class FakeDesktop(dbus.service.Object):
         self.record("close", id=int(notification_id), sender=str(sender))
 
 
-def worker(directory, action):
+def worker(directory, action, gate=None):
     module = load_candidate()
     module.BACKLIGHT = Path(directory)
     DBusGMainLoop(set_as_default=True)
@@ -186,6 +190,14 @@ def worker(directory, action):
         return subprocess.CompletedProcess(command, 0)
 
     module.subprocess.run = fake_pwm
+    if gate is not None:
+        gate = Path(gate)
+        gate.with_name(str(os.getpid()) + ".ready").touch()
+        deadline = time.monotonic() + 10
+        while not gate.exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Concurrent test start gate timed out")
+            time.sleep(0.01)
     return module.main([str(CANDIDATE), action])
 
 
@@ -226,6 +238,24 @@ class BrightnessTests(unittest.TestCase):
         self.clients.append(client)
         return client
 
+    def launch_concurrent(self, count, action):
+        # Warm imports first: runner CPU speed must not turn a concurrent burst
+        # into several requests separated by more than the popup's lifetime.
+        directory = Path(tempfile.mkdtemp(prefix="batch-", dir=self.directory.name))
+        gate = directory / "go"
+        try:
+            for _ in range(count):
+                self.clients.append(subprocess.Popen(
+                    [sys.executable, __file__, "worker", self.directory.name, action, str(gate)],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+            deadline = time.monotonic() + 8
+            while len(list(directory.glob("*.ready"))) != count:
+                if time.monotonic() >= deadline:
+                    self.fail("Concurrent clients failed to reach the start gate")
+                time.sleep(0.01)
+        finally:
+            gate.touch()
+
     def events(self, kind=None):
         events = json.loads(self.desktop.Events())
         return [event for event in events if kind is None or event["event"] == kind]
@@ -239,10 +269,13 @@ class BrightnessTests(unittest.TestCase):
         return self.events(kind)
 
     def finish(self):
+        results = []
         for client in self.clients:
             stdout, stderr = client.communicate(timeout=6)
-            self.assertEqual(client.returncode, 0, stderr)
+            results.append((client.returncode, stderr))
         self.clients.clear()
+        self.assertTrue(all(code == 0 for code, _ in results),
+                        f"Client results: {results}; events: {self.events()}")
 
     def test_sdr_up_stays_at_max_instead_of_reversing(self):
         self.launch("up")
@@ -261,10 +294,7 @@ class BrightnessTests(unittest.TestCase):
         self.assertEqual(self.events("pwm")[0]["target"], 355)
 
     def test_24_concurrent_keys_have_one_owner_and_no_lost_steps(self):
-        self.launch("down")
-        self.wait_events("notify", 1)
-        for _ in range(23):
-            self.launch("down")
+        self.launch_concurrent(24, "down")
         self.finish()
         self.assertEqual(len(self.events("notify")), 24)
         self.assertEqual(int(Path(self.directory.name, "brightness").read_text()), 4)
@@ -279,10 +309,7 @@ class BrightnessTests(unittest.TestCase):
 
     def test_seven_concurrent_keys_preserve_every_step_before_floor(self):
         self.desktop.Reset(0, 400, 400)
-        self.launch("down")
-        self.wait_events("notify", 1)
-        for _ in range(6):
-            self.launch("down")
+        self.launch_concurrent(7, "down")
         self.finish()
         self.assertEqual(int(Path(self.directory.name, "brightness").read_text()), 120)
         self.assertEqual([e["target"] for e in self.events("mutter")],
@@ -469,6 +496,6 @@ if __name__ == "__main__":
         desktop = FakeDesktop(sys.argv[2])
         GLib.MainLoop().run()
     elif len(sys.argv) > 1 and sys.argv[1] == "worker":
-        sys.exit(worker(sys.argv[2], sys.argv[3]))
+        sys.exit(worker(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else None))
     else:
         unittest.main(verbosity=2)
