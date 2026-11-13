@@ -1,6 +1,6 @@
 # zen-brightness
 
-A small GNOME brightness-key controller with separate HDR software dimming and
+A GNOME brightness-key controller with separate HDR software dimming and
 hardware PWM stages. One Python file; no permanent service or notification cache.
 
 **v0.1.0 is a prerelease.** Software behavior is tested; physical brightness,
@@ -8,7 +8,7 @@ flicker and live notification positioning still need hardware acceptance.
 
 ## Behavior
 
-- **SDR:** adjust hardware brightness through one consistent control path.
+- **SDR:** adjust hardware brightness without a software-dimming stage.
 - **HDR:** Down reduces software SDR intensity to its minimum, then PWM. Up
   restores PWM first, then raises SDR intensity.
 - Concurrent keypresses run sequentially in one short-lived `Gio.Application`.
@@ -34,7 +34,7 @@ is not assumed; see [maintenance](#maintenance).
 
 ## Install and bind keys
 
-Use the script inside a normal GNOME session, without running it as root.
+Run as the logged-in GNOME desktop user, without running the script as root.
 On Ubuntu, install runtime dependencies:
 
 ```sh
@@ -57,11 +57,14 @@ and stages an atomic replacement:
   install -m 0755 ./zen-brightness "$zen_brightness_stage"
   mv -f -- "$zen_brightness_stage" "$zen_brightness_target"
   sha256sum ./zen-brightness "$zen_brightness_target"
+  cmp --silent ./zen-brightness "$zen_brightness_target"
 )
 ```
 
-The two hashes must match. On a mismatch, stop and restore the backup. If any
-installation command fails, inspect its error before continuing.
+The two hashes must match; `cmp` also returns failure on a byte mismatch. Stop on
+any failed installation command. Restore the backup if one was made. On a first
+installation without a backup, preserve source and installed copies and do not
+bind or run the installed copy until the mismatch/error is resolved.
 
 In GNOME Settings → Keyboard → Custom Shortcuts, bind the brightness keys to
 these commands, replacing the example with the actual absolute home path:
@@ -80,7 +83,7 @@ change keybindings. Check the installed version with
 Install test dependencies on Ubuntu:
 
 ```sh
-sudo apt install python3-dbus dbus-daemon
+sudo apt install python3-gi python3-dbus dbus-daemon
 ```
 
 From the repository root:
@@ -120,6 +123,7 @@ hashes match:
   install -m 0755 "$zen_brightness_target.backup" "$zen_brightness_stage"
   mv -f -- "$zen_brightness_stage" "$zen_brightness_target"
   sha256sum "$zen_brightness_target.backup" "$zen_brightness_target"
+  cmp --silent "$zen_brightness_target.backup" "$zen_brightness_target"
 )
 ```
 
@@ -127,8 +131,8 @@ If the backup is missing or restoration verification fails, stop and preserve al
 copies. Do not select an older numbered backup automatically. Restore changed
 shortcuts from their saved values. After replacement, stop pressing keys for five
 seconds and check `busctl --user status local.zenbook.Brightness`; if the name is
-still owned, inspect that process before testing another version. Desktop restart
-or logout is not required.
+still owned, inspect that process before testing another version. Do not restart
+or log out of the desktop as part of these procedures.
 
 ## Maintenance
 
@@ -147,6 +151,10 @@ color modes are 0/default, 1/BT.2100 or 2/SDR native; `Backlight` must contain i
 serial and `connector`, `active`, `value`, `min`, `max` fields. Stop deployment on
 schema differences or failing tests. Rerunning tests does not establish physical
 display acceptance.
+
+For a new release, update `VERSION` in the runtime, the workflow's expected version,
+`CHANGELOG.md` and the README's prerelease notice together. Run tests before
+tagging that commit; build release assets and checksums from the tagged tree.
 
 ## License
 
