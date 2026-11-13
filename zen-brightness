@@ -1,0 +1,193 @@
+#!/usr/bin/python3
+"""Brightness keys for a qualified Zenbook panel: one process per burst."""
+import logging
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+from gi.repository import Gio, GLib
+
+PANEL = "eDP-1"
+DEVICE = "intel_backlight"
+BACKLIGHT = Path("/sys/class/backlight") / DEVICE
+HW_FLOOR = 4
+OSD_MS = 500
+DBUS_TIMEOUT_MS = 2000
+MUTTER = "org.gnome.Mutter.DisplayConfig"
+DISPLAY_PATH = "/org/gnome/Mutter/DisplayConfig"
+NOTIFICATIONS = "org.freedesktop.Notifications"
+NOTIFICATION_PATH = "/org/freedesktop/Notifications"
+VERSION = "0.1.0"
+
+
+def next_step(direction, hw, hw_max, hdr, sw, sw_min, sw_max):
+    """Return (control, target, title, percent) without touching the display."""
+    if direction not in ("up", "down"):
+        raise ValueError("Expected up or down")
+    if hw_max <= HW_FLOOR or sw_max <= sw_min:
+        raise ValueError("Invalid brightness range")
+    if not 0 <= hw <= hw_max or (hdr and not sw_min <= sw <= sw_max):
+        raise ValueError("Brightness value is outside its range")
+    if direction == "down" and hw < HW_FLOOR:
+        raise ValueError("Hardware brightness is already below the safe minimum")
+    delta = 1 if direction == "up" else -1
+    if hdr and ((delta < 0 and sw > sw_min) or (delta > 0 and hw >= hw_max)):
+        target = max(sw_min, min(sw_max, sw + delta * max(1, (sw_max - sw_min) // 10)))
+        return "mutter", target, "SDR intensity", round(100 * target / sw_max)
+    target = max(HW_FLOOR, min(hw_max, hw + delta * max(1, hw_max // 10)))
+    title = "Extra dark (PWM)" if hdr else "Brightness"
+    return "pwm" if hdr else "mutter", target, title, round(100 * target / hw_max)
+
+
+class Brightness(Gio.Application):
+    def __init__(self):
+        super().__init__(application_id="local.zenbook.Brightness",
+                         flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.set_inactivity_timeout(1000)
+        self.notification_id = 0
+        self.notification_owner = None
+        self.close_timer = 0
+        self.exit_status = 0
+
+    def do_startup(self):
+        Gio.Application.do_startup(self)
+        self.connection = self.get_dbus_connection()
+        self.connection.signal_subscribe(None, NOTIFICATIONS, "NotificationClosed", NOTIFICATION_PATH,
+                                         None, Gio.DBusSignalFlags.NONE, self.notification_closed)
+
+    def call(self, destination, path, interface, method, signature="()", args=()):
+        return self.connection.call_sync(
+            destination, path, interface, method, GLib.Variant(signature, args),
+            None, Gio.DBusCallFlags.NONE, DBUS_TIMEOUT_MS, None).unpack()
+
+    def display_call(self, method, signature="()", args=(), interface=MUTTER):
+        return self.call(MUTTER, DISPLAY_PATH, interface, method, signature, args)
+
+    def panel_info(self):
+        serial, outputs = self.display_call("Get", "(ss)", (MUTTER, "Backlight"),
+                                           interface="org.freedesktop.DBus.Properties")[0]
+        panel = next((p for p in outputs if p["connector"] == PANEL and p["active"]), None)
+        if panel is None:
+            raise RuntimeError("Built-in backlight is inactive")
+        return serial, panel
+
+    def change(self, direction):
+        # Re-read mode and serial: docking and HDR changes can happen between presses.
+        state = self.display_call("GetCurrentState")
+        monitor = next((m for m in state[1] if str(m[0][0]) == PANEL and m[2].get("is-builtin")), None)
+        if monitor is None:
+            raise RuntimeError("Built-in display is unavailable")
+        mode = int(monitor[2]["color-mode"])
+        if mode not in (0, 1, 2):
+            raise RuntimeError(f"Unsupported display color mode: {mode}")
+        hdr = mode == 1  # Mutter BT.2100; 0/default and 2/SDR native are SDR.
+        serial, panel = self.panel_info()
+        hw = int((BACKLIGHT / "brightness").read_text())
+        hw_max = int((BACKLIGHT / "max_brightness").read_text())
+        control, target, title, percent = next_step(
+            direction, hw, hw_max, hdr, int(panel["value"]), int(panel["min"]), int(panel["max"]))
+        # A previous direct write may leave Mutter's cache stale. If its cached
+        # target already equals our new target, SetBacklight can be a no-op.
+        if control == "pwm" or (not hdr and target == int(panel["value"])):
+            subprocess.run(["brightnessctl", "--device", DEVICE, "--quiet", "set", str(target)],
+                           check=True, timeout=2)
+        else:
+            self.display_call("SetBacklight", "(usi)", (serial, PANEL, target))
+        if control == "pwm" or not hdr:
+            # Mutter applies sysfs writes asynchronously. Wait before the next key
+            # reads hardware; a one-unit tolerance allows device rounding.
+            deadline = time.monotonic() + 0.3
+            while abs(int((BACKLIGHT / "brightness").read_text()) - target) > 1:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Hardware brightness did not reach its target")
+                time.sleep(0.005)
+        elif int(self.panel_info()[1]["value"]) != target:
+            raise RuntimeError("Software brightness did not reach its target")
+        return title, percent
+
+    def get_notification_owner(self):
+        def bus_call(method, signature, args):
+            return self.call("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                             "org.freedesktop.DBus", method, signature, args)
+        try:
+            return bus_call("GetNameOwner", "(s)", (NOTIFICATIONS,))[0]
+        except GLib.Error as error:
+            if Gio.DBusError.get_remote_error(error) != "org.freedesktop.DBus.Error.NameHasNoOwner":
+                raise
+            bus_call("StartServiceByName", "(su)", (NOTIFICATIONS, 0))
+            return bus_call("GetNameOwner", "(s)", (NOTIFICATIONS,))[0]
+
+    def show(self, title, percent):
+        # Bind the ID to a unique server, so a restart cannot reuse another app's ID.
+        owner = self.get_notification_owner()
+        if owner != self.notification_owner:
+            self.notification_id = 0
+            self.notification_owner = owner
+        hints = {name: GLib.Variant("b", value) for name, value in
+                 (("transient", True), ("resident", False), ("suppress-sound", True))}
+        self.notification_id = self.call(
+            owner, NOTIFICATION_PATH, NOTIFICATIONS, "Notify", "(susssasa{sv}i)",
+            ("notify-send", self.notification_id, "display-brightness-symbolic",
+             title, f"{percent}%", [], hints, 1000))[0]
+        if self.close_timer:
+            GLib.source_remove(self.close_timer)
+        self.close_timer = GLib.timeout_add(OSD_MS, self.close_popup)
+
+    def notification_closed(self, connection, sender, path, interface, signal, parameters):
+        if sender == self.notification_owner and parameters.unpack()[0] == self.notification_id:
+            self.notification_id = 0
+
+    def close_popup(self):
+        notification_id, self.notification_id = self.notification_id, 0
+        self.close_timer = 0
+        if notification_id:
+            try:
+                self.call(self.notification_owner, NOTIFICATION_PATH, NOTIFICATIONS,
+                          "CloseNotification", "(u)", (notification_id,))
+            except GLib.Error as error:
+                logging.warning("Cannot close brightness popup: %s", error)
+        return GLib.SOURCE_REMOVE
+
+    def do_command_line(self, command_line):
+        self.hold()
+        status = 0
+        try:
+            args = command_line.get_arguments()
+            if len(args) != 2 or args[1] not in ("up", "down"):
+                status = 2
+                return status
+            title, percent = self.change(args[1])
+            try:
+                self.show(title, percent)
+            except Exception:
+                logging.exception("Brightness changed; popup failed")
+            return status
+        except (GLib.Error, OSError, ValueError, KeyError, TypeError,
+                RuntimeError, subprocess.SubprocessError) as error:
+            logging.error("Brightness change failed: %s", error)
+            status = 1
+            return status
+        except Exception:
+            logging.exception("Unexpected brightness error")
+            status = 1
+            return status
+        finally:
+            if not command_line.get_is_remote():
+                self.exit_status = status
+            self.release()
+
+
+def main(args):
+    if args[1:] == ["--version"]:
+        print(VERSION)
+        return 0
+    if len(args) != 2 or args[1] not in ("up", "down"):
+        print("Usage: zen-brightness up|down|--version", file=sys.stderr)
+        return 2
+    app = Brightness()
+    return app.run(args) or app.exit_status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

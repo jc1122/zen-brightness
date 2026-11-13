@@ -1,0 +1,31 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y python3-gi python3-dbus dbus-daemon
+      - name: Check Python syntax and version
+        run: |
+          /usr/bin/python3 -m py_compile zen-brightness test_brightness.py test_gnome.py
+          test "$(./zen-brightness --version)" = "0.1.0"
+      - name: Test on a private session bus
+        run: dbus-run-session -- /usr/bin/python3 test_brightness.py
